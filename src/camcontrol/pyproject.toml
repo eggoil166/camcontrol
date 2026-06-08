@@ -1,0 +1,26 @@
+[project]
+name = "camcontrol"
+version = "0.1.0"
+description = "Head-pose pointer + dwell-to-select for terminal panes."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+"opencv-python",
+"mediapipe",
+]
+
+[project.scripts]
+camcontrol = "camcontrol.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
