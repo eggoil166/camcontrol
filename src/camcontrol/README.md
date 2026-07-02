@@ -11,6 +11,10 @@ pure sockets, OpenCV, and MediaPipe; no OS-specific code.
 - A webcam and [uv](https://docs.astral.sh/uv/).
 - Dependencies (OpenCV, MediaPipe) are managed by uv; no manual venv activation.
 
+On Nix, `nix develop` drops you into a shell with `uv`, Python 3.11, and the
+native libraries the OpenCV/MediaPipe wheels need — then use the `uv run …`
+commands below as usual.
+
 ## Usage
 
 Run from this directory (where `pyproject.toml` lives) so uv picks up the project
