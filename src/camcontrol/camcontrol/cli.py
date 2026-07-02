@@ -1,117 +1,169 @@
-"""CLI entry point (SPEC 11).
+"""CLI: stream head-tracking events over a port, or calibrate.
 
-Subcommands: start / stop / status (manage the detached daemon), run (daemon in
-the foreground for debugging), calibrate (drive the running daemon's 4-corner
-sequence over the control socket).
+Two commands, both foreground and cross-platform (no daemon, no OS-specific code):
+- ``serve``     : camera -> tracker -> One Euro -> calibration -> broadcast events.
+- ``calibrate`` : interactive 4-corner capture saved to ~/.camcontrol/calibration.json.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
+import statistics
+import time
 
-from camcontrol import service, window
-from camcontrol.calibration import CORNER_SEQUENCE, Calibration
-from camcontrol.config import Config, calibration_path, config_path
-from camcontrol.control import ControlClient
+from camcontrol.calibration import CORNER_SEQUENCE, Calibration, Corners
+from camcontrol.config import Config, calibration_path
+from camcontrol.server import EventServer
+
+logger = logging.getLogger(__name__)
+
+
+def make_event(
+    t: float,
+    detected: bool,
+    raw: tuple[float, float] | None = None,
+    filtered: tuple[float, float] | None = None,
+    screen: tuple[float, float] | None = None,
+) -> dict:
+    """Build one JSON-serializable event. Undetected frames carry only t+detected."""
+    if not detected:
+        return {"t": t, "detected": False}
+    return {
+        "t": t,
+        "detected": True,
+        "raw": {"yaw": raw[0], "pitch": raw[1]},
+        "filtered": {"yaw": filtered[0], "pitch": filtered[1]},
+        "screen": {"x": screen[0], "y": screen[1]},
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="camcontrol", description="Head-pointer terminal control.")
+    parser = argparse.ArgumentParser(prog="camcontrol", description="Head-tracking event stream.")
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("start", help="start the detached daemon")
-    sub.add_parser("stop", help="stop the daemon")
-    sub.add_parser("status", help="show daemon status")
-    sub.add_parser("calibrate", help="run the 4-corner calibration (headless)")
-    sub.add_parser("gui", help="open the fullscreen calibrate + preview window")
-    sub.add_parser("run", help="run the daemon in the foreground (debug)")
+    serve = sub.add_parser("serve", help="stream head-tracking events over a TCP port")
+    serve.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost)")
+    serve.add_argument("--port", type=int, default=8765, help="TCP port (default: 8765)")
+    serve.add_argument("--camera", type=int, default=0, help="camera index (default: 0)")
+    cal = sub.add_parser("calibrate", help="interactive 4-corner calibration")
+    cal.add_argument("--camera", type=int, default=0, help="camera index (default: 0)")
     return parser
-
-
-def _load_config() -> Config:
-    return Config.load_or_default(config_path())
 
 
 def _load_calibration() -> Calibration:
     path = calibration_path()
     if path.exists():
         return Calibration.load(path)
-    w, h = window.screen_size()
-    return Calibration.default(w, h)
+    logger.warning(
+        "no calibration at %s; using a placeholder. Run `camcontrol calibrate`.", path
+    )
+    return Calibration.default()
 
 
-def _running_daemon() -> dict | None:
-    """Runtime info of the live daemon, or None (with a message) if it isn't up."""
-    rt = service.read_runtime()
-    if rt is None or not service.is_running():
-        print("Daemon not running. Start it first: camcontrol start")
-        return None
-    return rt
+def _open_pipeline(camera_index: int, cfg: Config):
+    """Open camera + tracker (lazy import keeps cv2/mediapipe out of the import path)."""
+    from camcontrol.camera import CameraSource
+    from camcontrol.tracker.base import TrackerSettings
+    from camcontrol.tracker.mediapipe_tracker import MediaPipeTracker
+
+    cam = CameraSource(index=camera_index)
+    if not cam.open():
+        return None, None
+    tracker = MediaPipeTracker()
+    tracker.start(TrackerSettings(max_inference_dim=cfg.max_inference_dim))
+    return cam, tracker
 
 
-def _run_foreground(config: Config) -> None:
-    if service.is_running():
-        print("A camcontrol daemon is already running. Stop it first: camcontrol stop")
+def _serve(host: str, port: int, camera_index: int) -> None:
+    from camcontrol.filtering.one_euro import OneEuroFilter
+
+    cfg = Config()
+    calibration = _load_calibration()
+    cam, tracker = _open_pipeline(camera_index, cfg)
+    if cam is None:
+        print("Could not open the camera. Is another app using it?")
         return
-    from camcontrol.controller import Controller  # lazy: pulls cv2/mediapipe
-
-    Controller(config, _load_calibration()).run()
-
-
-def _gui() -> None:
-    rt = _running_daemon()
-    if rt is None:
-        return
-    from camcontrol.gui import run_gui  # lazy: pulls in tkinter
-
-    run_gui(port=rt["port"])
-
-
-def _calibrate() -> None:
-    rt = _running_daemon()
-    if rt is None:
-        return
-    client = ControlClient(port=rt["port"], timeout=10.0)
-    client.request({"cmd": "begin_calibration"})
-    print("Calibration: look at each corner, then press ENTER.\n")
+    f_yaw = OneEuroFilter(cfg.one_euro_min_cutoff, cfg.one_euro_beta)
+    f_pitch = OneEuroFilter(cfg.one_euro_min_cutoff, cfg.one_euro_beta)
+    server = EventServer(host=host, port=port)
+    server.start()
+    print(f"Serving head-tracking events on {host}:{server.port} (Ctrl+C to stop).")
     try:
-        corners: dict[str, list[float]] = {}
-        for key, label in CORNER_SEQUENCE:
-            corners[key] = _capture_corner(client, label)
-        w, h = window.screen_size()
-        resp = client.request({"cmd": "commit_calibration", "corners": corners, "screen": [w, h]})
-        if resp.get("ok"):
-            print("\nCalibration saved.")
-        else:
-            print(f"\nCalibration failed: {resp.get('error')}")
+        while True:
+            ok, frame = cam.read()
+            if not ok:
+                continue
+            result = tracker.step(frame, int(time.monotonic() * 1000))
+            now = time.time()
+            if not result.detected:
+                server.broadcast(make_event(now, False))
+                continue
+            raw = (result.angles.yaw, result.angles.pitch)
+            mono = time.monotonic()
+            filtered = (f_yaw(raw[0], mono), f_pitch(raw[1], mono))
+            screen = calibration.to_screen(*filtered)
+            server.broadcast(make_event(now, True, raw=raw, filtered=filtered, screen=screen))
     except KeyboardInterrupt:
-        client.request({"cmd": "cancel_calibration"})
-        print("\nCalibration cancelled.")
+        pass
+    finally:
+        server.stop()
+        tracker.stop()
+        cam.close()
 
 
-def _capture_corner(client: ControlClient, label: str) -> list[float]:
+def _median_angles(samples: list[tuple[float, float]]) -> tuple[float, float]:
+    return (
+        statistics.median(s[0] for s in samples),
+        statistics.median(s[1] for s in samples),
+    )
+
+
+def _capture_corner(cam, tracker, label: str) -> tuple[float, float]:
     while True:
         input(f"  Look at the {label} corner and press ENTER...")
-        resp = client.request({"cmd": "sample"})
-        if resp.get("detected"):
-            return [resp["yaw"], resp["pitch"]]
+        samples: list[tuple[float, float]] = []
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and len(samples) < 5:
+            ok, frame = cam.read()
+            if not ok:
+                continue
+            result = tracker.step(frame, int(time.monotonic() * 1000))
+            if result.detected:
+                samples.append((result.angles.yaw, result.angles.pitch))
+        if len(samples) >= 3:
+            return _median_angles(samples)
         print("  No face detected — hold still and try again.")
 
 
+def _calibrate(camera_index: int) -> None:
+    cfg = Config()
+    cam, tracker = _open_pipeline(camera_index, cfg)
+    if cam is None:
+        print("Could not open the camera. Is another app using it?")
+        return
+    print("Calibration: look at each corner, then press ENTER.\n")
+    try:
+        captured = {key: _capture_corner(cam, tracker, label) for key, label in CORNER_SEQUENCE}
+        calibration = Calibration.fit_from_corners(Corners(**captured))
+        calibration.save(calibration_path())
+        print(f"\nCalibration saved to {calibration_path()}.")
+    except ValueError as exc:
+        print(f"\nCalibration failed: {exc}")
+    except KeyboardInterrupt:
+        print("\nCalibration cancelled.")
+    finally:
+        tracker.stop()
+        cam.close()
+
+
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.cmd == "start":
-        service.start(_load_config())
-    elif args.cmd == "stop":
-        service.stop()
-    elif args.cmd == "status":
-        service.status()
+    if args.cmd == "serve":
+        _serve(args.host, args.port, args.camera)
     elif args.cmd == "calibrate":
-        _calibrate()
-    elif args.cmd == "gui":
-        _gui()
-    elif args.cmd == "run":
-        _run_foreground(_load_config())
+        _calibrate(args.camera)
     else:
         parser.print_help()
     return 0
