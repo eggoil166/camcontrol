@@ -1,39 +1,53 @@
 # camcontrol
 
-Head-pose pointer with dwell-to-select for the terminal. A webcam + MediaPipe
-track your head; a calibrated gaze point maps to a grid over the foreground
-terminal window, and dwelling on a cell commits a selection. Built to later drive
-tmux pane focus (see the design notes referenced in the code's SPEC markers).
-
-A detached, windowless daemon owns the camera; foreground commands talk to it over
-a localhost JSON-lines control socket. Windows-only today, but OS-specific pieces
-(process spawn, window/DPI, global hotkey) sit behind `sys.platform` seams for a
-future Linux backend.
+Streams head-tracking events over a local TCP port. A webcam + MediaPipe track
+your head; for each frame the server pushes a JSON line with the raw and
+filtered (yaw, pitch) plus an estimated normalized screen position `[0,1]²`
+derived from a 4-corner calibration. Cross-platform (Linux, macOS, Windows) —
+pure sockets, OpenCV, and MediaPipe; no OS-specific code.
 
 ## Requirements
 
-- Windows, a webcam, and [uv](https://docs.astral.sh/uv/).
+- A webcam and [uv](https://docs.astral.sh/uv/).
 - Dependencies (OpenCV, MediaPipe) are managed by uv; no manual venv activation.
+
+On Nix, `nix develop` drops you into a shell with `uv`, Python 3.11, and the
+native libraries the OpenCV/MediaPipe wheels need — then use the `uv run …`
+commands below as usual.
 
 ## Usage
 
 Run from this directory (where `pyproject.toml` lives) so uv picks up the project
 environment:
 
-```powershell
-uv run camcontrol start      # launch the background daemon (disarmed; camera off)
-uv run camcontrol gui        # fullscreen calibrate + live-preview window
-uv run camcontrol calibrate  # headless 4-corner calibration (TOP-LEFT -> TR -> BL -> BR)
-uv run camcontrol status     # daemon state
-uv run camcontrol stop       # shut the daemon down
-uv run camcontrol run        # run the daemon in the foreground (debug; logs to stdout)
+```bash
+uv run camcontrol calibrate            # 4-corner calibration (look at each, press ENTER)
+uv run camcontrol serve                # stream events on 127.0.0.1:8765
+uv run camcontrol serve --port 9000 --host 0.0.0.0 --camera 1
 ```
 
-Press the toggle hotkey (default `Ctrl+Alt+H`) to arm/disarm. Config and
-calibration live under `~/.camcontrol/`.
+Connect any TCP client to read the stream, e.g.:
+
+```bash
+nc 127.0.0.1 8765
+```
+
+Each line is one event:
+
+```json
+{"t": 1719500000.123, "detected": true,
+ "raw": {"yaw": -4.2, "pitch": 3.1},
+ "filtered": {"yaw": -3.9, "pitch": 3.0},
+ "screen": {"x": 0.42, "y": 0.58}}
+```
+
+`screen` is normalized `[0,1]²` (top-left origin); multiply by your resolution
+for pixels. Frames with no face detected emit `{"t", "detected": false}` only.
+Calibration is stored under `~/.camcontrol/calibration.json`; without it, serve
+falls back to a rough placeholder mapping.
 
 ## Development
 
-```powershell
+```bash
 uv run pytest
 ```

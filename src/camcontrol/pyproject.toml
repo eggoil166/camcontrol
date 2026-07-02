@@ -1,7 +1,7 @@
 [project]
 name = "camcontrol"
 version = "0.1.0"
-description = "Head-pose pointer + dwell-to-select for terminal panes."
+description = "Stream head-tracking events (raw/filtered angles + screen position) over a TCP port."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
